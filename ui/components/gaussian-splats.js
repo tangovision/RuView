@@ -128,6 +128,29 @@ export class GaussianSplatRenderer {
 
     // Start render loop
     this._animate();
+
+    // Person counter overlay
+    this.counterOverlay = document.createElement('div');
+    this.counterOverlay.className = 'gaussian-counter-overlay';
+    this.counterOverlay.style.position = 'absolute';
+    this.counterOverlay.style.top = '15px';
+    this.counterOverlay.style.right = '15px';
+    this.counterOverlay.style.backgroundColor = 'rgba(10, 10, 18, 0.85)';
+    this.counterOverlay.style.border = '1px solid #1a4a5a';
+    this.counterOverlay.style.borderRadius = '8px';
+    this.counterOverlay.style.padding = '12px 18px';
+    this.counterOverlay.style.color = '#556677';
+    this.counterOverlay.style.fontFamily = 'monospace';
+    this.counterOverlay.style.fontSize = '1.2rem';
+    this.counterOverlay.style.pointerEvents = 'none';
+    this.counterOverlay.style.zIndex = '100';
+    this.counterOverlay.innerHTML = 'Persons: <span class="count" style="font-weight: bold;">0</span>';
+    
+    // Ensure container is positioned relatively so the absolute overlay is contained
+    if (getComputedStyle(container).position === 'static') {
+      container.style.position = 'relative';
+    }
+    container.appendChild(this.counterOverlay);
   }
 
   // ---- Scene setup -------------------------------------------------------
@@ -412,6 +435,23 @@ export class GaussianSplatRenderer {
             this.nodeMarkers.delete(id);
           }
         }
+      }
+    }
+
+    // -- Update person count overlay ---------------------------------------
+    if (this.counterOverlay) {
+      const countEl = this.counterOverlay.querySelector('.count');
+      if (countEl) {
+        // Use estimated_persons (set by Rust server) or count objects if available
+        let persons = data.estimated_persons || 0;
+        
+        // Fallback for older server versions or mincut-person-counter.js wrapper
+        if (!persons && data.total_persons !== undefined) {
+            persons = data.total_persons;
+        }
+
+        countEl.textContent = persons;
+        this.counterOverlay.style.color = persons > 0 ? '#00ff88' : '#556677';
       }
     }
   }
