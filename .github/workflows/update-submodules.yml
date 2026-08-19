@@ -1,13 +1,21 @@
 name: Update vendor submodules
 
 on:
+  # Weekly, not 6-hourly. Every submodule in .gitmodules points at `ruvnet/*`,
+  # a third-party org, so each run ingests code nobody here wrote. A slow
+  # cadence keeps the pointer diff small enough to actually read.
   schedule:
-    - cron: '0 */6 * * *'  # Every 6 hours
-  workflow_dispatch:        # Manual trigger
+    - cron: '0 6 * * 1'  # Mondays 06:00 UTC
+  workflow_dispatch:      # Manual trigger
 
 permissions:
   contents: write
   pull-requests: write
+
+# The rolling branch below is force-pushed, so two runs must never overlap.
+concurrency:
+  group: update-vendor-submodules
+  cancel-in-progress: false
 
 jobs:
   update:
@@ -16,6 +24,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           submodules: true
+          # Full history, and with it every remote branch — the force-with-lease
+          # below needs to see the rolling branch if it already exists.
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -41,27 +51,70 @@ jobs:
       - name: Check for changes
         id: check
         run: |
-          if git diff --quiet; then
+          # `--ignore-submodules=dirty` restricts this to gitlink (pointer)
+          # moves. Without it, untracked build output left inside a vendored
+          # checkout reads as a change and opens a PR with an empty diff.
+          if git diff --quiet --ignore-submodules=dirty; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
+            # Not scoped to vendor/: three submodules live under v2/crates/.
+            git diff --submodule=log --ignore-submodules=dirty \
+              > "$RUNNER_TEMP/pointer-diff.txt"
             echo "--- submodule pointer changes ---"
-            git submodule status --recursive || true
-            git diff --submodule=log -- vendor/ || true
+            cat "$RUNNER_TEMP/pointer-diff.txt"
           fi
 
-      - name: Create PR with updates
+      # One rolling branch, rebuilt from main every run, force-pushed in place.
+      # The old code derived a fresh `chore/update-submodules-$(date ...)` branch
+      # per run and always called `gh pr create`. Since the PR needs human review
+      # and so sits open, main kept the old pins, the diff was non-empty again
+      # 6 hours later, and a duplicate PR was opened — seven of them by
+      # 2026-08-19. Reusing the branch means a still-open PR is updated instead.
+      - name: Open or refresh the rolling vendor-bump PR
         if: steps.check.outputs.changed == 'true'
-        run: |
-          BRANCH="chore/update-submodules-$(date +%Y%m%d-%H%M%S)"
-          git checkout -b "$BRANCH"
-          git add vendor/
-          git commit -m "chore: update vendor submodules to latest upstream"
-          git push origin "$BRANCH"
-          gh pr create \
-            --title "chore: update vendor submodules" \
-            --body "Automated submodule update to the latest upstream commit on each submodule's tracked branch (see \`.gitmodules\`). Review the pointer diff before merging." \
-            --base main \
-            --head "$BRANCH"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: chore/update-vendor-submodules
+        run: |
+          set -euo pipefail
+
+          git checkout -B "$BRANCH"
+          # `-u` stages every moved gitlink; the old `git add vendor/` silently
+          # missed v2/crates/{ruv-neural,ruview-swarm,worldgraph} and would have
+          # failed the commit outright on a week when only those moved.
+          git add -u
+          git commit -m "chore: update vendor submodules to latest upstream"
+
+          # This branch is written by nothing but this workflow, so replacing it
+          # is expected. Lease against the SHA we actually observed rather than a
+          # remote-tracking ref, which does not exist on the very first run.
+          if remote_sha=$(git ls-remote --exit-code origin "refs/heads/$BRANCH" | cut -f1); then
+            git push --force-with-lease="refs/heads/$BRANCH:$remote_sha" \
+              origin "HEAD:refs/heads/$BRANCH"
+          else
+            git push origin "HEAD:refs/heads/$BRANCH"
+          fi
+
+          {
+            printf 'Automated weekly bump of the vendored submodules to the latest upstream commit on each tracked branch (see `.gitmodules`).\n\n'
+            printf '> **This is third-party code.** Every submodule here points at the `ruvnet/*` org. Read the pointer diff and the upstream commits before merging — this PR is the review gate, not a formality.\n\n'
+            printf 'Checks will not start on their own: the PR is authored by `github-actions[bot]`, and GitHub does not run workflows for `GITHUB_TOKEN`-authored pull requests. Press **Approve and run workflows** on the checks tab, then merge once they are green.\n\n'
+            printf '<details><summary>Submodule pointer diff</summary>\n\n```\n'
+            cat "$RUNNER_TEMP/pointer-diff.txt"
+            printf '\n```\n\n</details>\n'
+          } > "$RUNNER_TEMP/pr-body.md"
+
+          existing=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            # Force-pushing already moved the PR head; refresh the body so the
+            # pointer diff shown matches the commit now under review.
+            gh pr edit "$existing" --body-file "$RUNNER_TEMP/pr-body.md"
+            echo "Refreshed existing PR #$existing"
+          else
+            gh pr create \
+              --title "chore: update vendor submodules" \
+              --body-file "$RUNNER_TEMP/pr-body.md" \
+              --base main \
+              --head "$BRANCH"
+          fi
